@@ -3,7 +3,7 @@ mod data;
 use clap::Parser;
 use data::Message;
 use log::{error, info};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, ConnectionError, Event, Incoming, MqttOptions, Outgoing, Packet, QoS};
 use serde_json::Value;
 use serialport::SerialPort;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,12 +79,10 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, args: Args) -> Resul
 
     let clear_topic = args.mqtt_topic.clone() + "/clear";
 
-    log::info!("mqtt client connecting ...");
+    log::info!("MQTT connecting.");
 
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
     client.subscribe(&clear_topic, QoS::AtMostOnce).await.unwrap();
-
-    log::info!("mqtt client connected");
 
     task::spawn(async move {
         loop {
@@ -108,16 +106,44 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, args: Args) -> Resul
         }
     });
 
-    while let Ok(notification) = eventloop.poll().await {
-        if let Event::Incoming(Packet::Publish(packet)) = notification {
-            if packet.topic == clear_topic {
-                log::info!("Received 'clear' packet: {:?}", packet.payload);
-                reset.store(true, Ordering::Relaxed);
+    loop {
+        let event = eventloop.poll().await;
+
+        match event {
+            Ok(Event::Incoming(Packet::Publish(packet))) => {
+                if packet.topic == clear_topic {
+                    log::info!("Received 'clear' packet.");
+                    reset.store(true, Ordering::Relaxed);
+                }
+            }
+            Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+                log::info!("MQTT connected.");
+            }
+            Ok(Event::Incoming(Incoming::PingReq)) => (),
+            Ok(Event::Incoming(Incoming::PingResp)) => (),
+            Ok(Event::Outgoing(Outgoing::PingResp)) => (),
+            Ok(Event::Outgoing(Outgoing::PingReq)) => (),
+            Ok(Event::Outgoing(Outgoing::Subscribe(_))) => (),
+            Ok(Event::Incoming(Incoming::SubAck(_))) => (),
+            Ok(Event::Outgoing(Outgoing::Publish(_))) => (),
+            Ok(Event::Incoming(Incoming::PubAck(_))) => (),
+            Err(ConnectionError::Io(_)) => {
+                log::info!("MQTT connection error. Waiting for 2 secs before trying again");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(ConnectionError::MqttState(rumqttc::StateError::Io(e))) if e.kind() == std::io::ErrorKind::ConnectionAborted => {
+                log::info!("MQTT connection aborted.  Waiting for 2 secs before trying again");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            Err(ConnectionError::ConnectionRefused(reason)) => {
+                log::info!("MQTT connection refused: {:?}.  Aborting.", reason);
+                return Ok(());
+            }
+            other => {
+                log::info!("Other: {:?}", other);
             }
         }
     }
-
-    Ok(())
 }
 
 fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBool>, args: Args) -> JoinHandle<()> {
