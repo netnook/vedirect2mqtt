@@ -1,13 +1,13 @@
 # vedirect2mqtt
 
-This project provides a tool to reading data from [Victron Energy](https://www.victronenergy.com/) devices which provide a [VE.Direct](https://www.victronenergy.com/live/vedirect_protocol:faq) interface (e.g. Victron's MPPT and BMV devices).
+This project provides a tool for reading data from [Victron Energy](https://www.victronenergy.com/) devices which provide a [VE.Direct](https://www.victronenergy.com/live/vedirect_protocol:faq) interface (e.g. Victron's MPPT and BMV devices).
 
 ## Features
 
 * Reads text encoded data provided by VE.Direct interface (typically sent by devices once per second).
-* Sends data an MQTT topic at defined intervals (default every 60 seconds).
+* Sends data to an MQTT topic at defined intervals (default 60 seconds).
 * Auto-reconnect to MQTT server.
-* Averaging of values where it makes sense (current, voltage).
+* Averaging of values where it makes sense (current, voltage) between publications to MQTT.
 * Best effort integration of battery current over time - allows approximation of state-of-charge.
 
 ## Notably missing
@@ -23,19 +23,20 @@ This project provides a tool to reading data from [Victron Energy](https://www.v
 
 Configuration is in TOML.  Fields are required unless stated otherwise. Example:
 
-  [mqtt]
-  host = "mqtt.at.home"
-  port = 1883 # (optional, default=1883)
-  username = "mememe"
-  password = "best-kept-secret"
-  topic = "my/solar/topic" # (optional, default=vedirect2mqtt)
-  
-  [device]
-  path = "/dev/ttyUSB0"
-  
-  [publish]
-  interval = 300 # (optional, default=60) number of seconds interval between publishing data to mqtt
-  
+```
+[mqtt]
+host = "mqtt.at.home"
+port = 1883 # (optional, default=1883)
+username = "mememe"
+password = "best-kept-secret"
+topic = "my/solar/topic" # (optional, default=vedirect2mqtt)
+
+[device]
+path = "/dev/ttyUSB0"
+
+[publish]
+interval = 300 # (optional, default=60) number of seconds interval between publishing data to mqtt
+```
 
 ## Status
 
