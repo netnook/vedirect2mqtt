@@ -6,6 +6,7 @@ use log::{error, info};
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
 use serde_json::Value;
 use serialport::SerialPort;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -60,15 +61,16 @@ async fn main() {
         .expect("Failed to open serial connection");
 
     let data = Arc::new(Mutex::new(None));
+    let reset = Arc::new(AtomicBool::new(false));
 
-    let h = start_receiver(p, Arc::clone(&data), args.clone());
+    let h = start_receiver(p, Arc::clone(&data), Arc::clone(&reset), args.clone());
 
-    start_mqtt(data, args).await.unwrap();
+    start_mqtt(data, reset, args).await.unwrap();
 
     h.join().unwrap();
 }
 
-async fn start_mqtt(data: DataLock, args: Args) -> Result<(), tokio::io::Error> {
+async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, args: Args) -> Result<(), tokio::io::Error> {
     let mut mqttoptions = MqttOptions::new(args.mqtt_client_id, args.mqtt_host, args.mqtt_port);
     mqttoptions.set_credentials(args.mqtt_username, args.mqtt_password);
     mqttoptions.set_keep_alive(Duration::from_secs(5));
@@ -110,6 +112,7 @@ async fn start_mqtt(data: DataLock, args: Args) -> Result<(), tokio::io::Error> 
         if let Event::Incoming(Packet::Publish(packet)) = notification {
             if packet.topic == clear_topic {
                 log::info!("Received 'clear' packet: {:?}", packet.payload);
+                reset.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -117,7 +120,7 @@ async fn start_mqtt(data: DataLock, args: Args) -> Result<(), tokio::io::Error> 
     Ok(())
 }
 
-fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, args: Args) -> JoinHandle<()> {
+fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBool>, args: Args) -> JoinHandle<()> {
     let mut reader = SerialReader::new(port);
 
     thread::spawn(move || {
@@ -146,6 +149,11 @@ fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, args: Args) -> Join
             }
 
             if now >= publish_message_at && collector.message_count() > 0 {
+                if reset.swap(false, Ordering::Relaxed) {
+                    // FIXME: this reset means count=0 and no value gets transmitted.  How to guarantee the 0 gets sent ?
+                    collector.reset_totals();
+                }
+
                 // log::info!("Collector {:?}", collector);
                 let msg = collector.build_json_message();
                 // log::info!("Collector output message {:?}", msg);

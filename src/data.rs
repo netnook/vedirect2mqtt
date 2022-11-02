@@ -48,7 +48,7 @@ struct NumberCollector<T> {
 
 impl<T> NumberCollector<T>
 where
-    T: std::ops::AddAssign,
+    T: std::ops::AddAssign + Default,
 {
     fn add(&mut self, value: Option<T>) {
         if let Some(v) = value {
@@ -64,6 +64,11 @@ where
     fn clear_count(mut self) -> Self {
         self.count = 0;
         self
+    }
+
+    fn reset(&mut self) {
+        self.sum = Default::default();
+        self.count = 0;
     }
 }
 
@@ -197,6 +202,11 @@ impl Collector {
 
     pub fn message_count(&self) -> usize {
         self.message_count
+    }
+
+    pub fn reset_totals(&mut self) {
+        self.main_battery_energy_in_total.reset();
+        self.main_battery_energy_out_total.reset();
     }
 
     pub(crate) fn collect(&mut self, msg: Message) {
