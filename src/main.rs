@@ -1,6 +1,7 @@
+mod config;
 mod data;
 
-use clap::Parser;
+use config::Config;
 use data::Message;
 use log::{error, info};
 use rumqttc::{AsyncClient, ConnectionError, Event, Incoming, MqttOptions, Outgoing, Packet, QoS};
@@ -12,34 +13,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tokio::{task, time};
 
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(long)]
-    device: String,
-
-    #[arg(long)]
-    mqtt_host: String,
-
-    #[arg(long, default_value_t = 1883)]
-    mqtt_port: u16,
-
-    #[arg(long)]
-    mqtt_username: String,
-
-    #[arg(long)]
-    mqtt_password: String,
-
-    #[arg(long, default_value = "vedirect2mqtt")]
-    mqtt_client_id: String,
-
-    #[arg(long)]
-    mqtt_topic: String,
-
-    #[arg(long, default_value_t = 60)]
-    interval: u64,
-}
-
 type DataLock = Arc<Mutex<Option<Value>>>;
 
 #[tokio::main(flavor = "current_thread")]
@@ -48,11 +21,11 @@ async fn main() {
     let env = env_logger::Env::new().filter_or("LOG", "info");
     env_logger::Builder::from_env(env).init();
 
-    let args = Args::parse();
+    let config = config::get();
 
     log::info!("Starting");
 
-    let p = serialport::new(args.device.clone(), 19200)
+    let p = serialport::new(config.device.path.clone(), 19200)
         .stop_bits(serialport::StopBits::One)
         .data_bits(serialport::DataBits::Eight)
         .parity(serialport::Parity::None)
@@ -63,21 +36,21 @@ async fn main() {
     let data = Arc::new(Mutex::new(None));
     let reset = Arc::new(AtomicBool::new(false));
 
-    let h = start_receiver(p, Arc::clone(&data), Arc::clone(&reset), args.clone());
+    let h = start_receiver(p, Arc::clone(&data), Arc::clone(&reset), config.clone());
 
-    start_mqtt(data, reset, args).await.unwrap();
+    start_mqtt(data, reset, config).await.unwrap();
 
     h.join().unwrap();
 }
 
-async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, args: Args) -> Result<(), tokio::io::Error> {
-    let mut mqttoptions = MqttOptions::new(args.mqtt_client_id, args.mqtt_host, args.mqtt_port);
-    mqttoptions.set_credentials(args.mqtt_username, args.mqtt_password);
+async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, config: Config) -> Result<(), tokio::io::Error> {
+    let mut mqttoptions = MqttOptions::new(config.mqtt.client_id, config.mqtt.host, config.mqtt.port);
+    mqttoptions.set_credentials(config.mqtt.username.unwrap(), config.mqtt.password.unwrap());
     mqttoptions.set_keep_alive(Duration::from_secs(5));
     mqttoptions.set_connection_timeout(5);
     mqttoptions.set_clean_session(true);
 
-    let clear_topic = args.mqtt_topic.clone() + "/clear";
+    let clear_topic = config.mqtt.topic.clone() + "/clear";
 
     log::info!("MQTT connecting.");
 
@@ -98,7 +71,7 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, args: Args) -> Resul
                 }
 
                 client
-                    .publish(args.mqtt_topic.clone(), QoS::AtLeastOnce, false, json.unwrap())
+                    .publish(config.mqtt.topic.clone(), QoS::AtLeastOnce, false, json.unwrap())
                     .await
                     .map_err(|e| log::warn!("Error publishine message: {}", e))
                     .ok();
@@ -146,15 +119,15 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, args: Args) -> Resul
     }
 }
 
-fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBool>, args: Args) -> JoinHandle<()> {
+fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBool>, config: Config) -> JoinHandle<()> {
     let mut reader = SerialReader::new(port);
 
     thread::spawn(move || {
         info!("Started receiver thread");
 
-        let interval = Duration::from_secs(args.interval);
+        let interval = Duration::from_secs(config.publish.interval);
         let mut collector = data::Collector::new();
-        let mut publish_message_at = Instant::now() + Duration::from_secs(15);
+        let mut publish_message_at = Instant::now() + interval;
 
         loop {
             let now = Instant::now();
