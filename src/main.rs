@@ -25,7 +25,7 @@ async fn main() {
 
     log::info!("Starting");
 
-    let p = serialport::new(config.device.path.clone(), 19200)
+    let port = serialport::new(config.device.path.clone(), 19200)
         .stop_bits(serialport::StopBits::One)
         .data_bits(serialport::DataBits::Eight)
         .parity(serialport::Parity::None)
@@ -36,7 +36,7 @@ async fn main() {
     let data = Arc::new(Mutex::new(None));
     let reset = Arc::new(AtomicBool::new(false));
 
-    let h = start_receiver(p, Arc::clone(&data), Arc::clone(&reset), config.clone());
+    let h = start_receiver(port, Arc::clone(&data), Arc::clone(&reset), config.clone());
 
     start_mqtt(data, reset, config).await.unwrap();
 
@@ -120,7 +120,7 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, config: Config) -> R
 }
 
 fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBool>, config: Config) -> JoinHandle<()> {
-    let mut reader = SerialReader::new(port);
+    let mut decoder = SerialDecoder::new(port);
 
     thread::spawn(move || {
         info!("Started receiver thread");
@@ -131,7 +131,7 @@ fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBo
 
         loop {
             let now = Instant::now();
-            match reader.read() {
+            match decoder.read() {
                 Ok(msg) => {
                     collector.collect(msg);
                 }
@@ -170,15 +170,16 @@ fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBo
 }
 
 #[derive(Clone, PartialEq)]
-enum ReaderState {
+enum DecoderState {
     Idle,
     FieldName,
     FieldValue,
     Checksum,
     HexRecord,
 }
-struct SerialReader {
-    port: Box<dyn serialport::SerialPort>,
+
+struct SerialDecoder<T> {
+    reader: T,
     buf: [u8; 1024],
     buf_start: usize,
     buf_end: usize,
@@ -186,10 +187,13 @@ struct SerialReader {
     field_value: String,
 }
 
-impl SerialReader {
-    fn new(port: Box<dyn serialport::SerialPort>) -> SerialReader {
-        SerialReader {
-            port,
+impl<T> SerialDecoder<T>
+where
+    T: std::io::Read,
+{
+    fn new(reader: T) -> SerialDecoder<T> {
+        SerialDecoder {
+            reader,
             buf: [0; 1024],
             buf_start: 0,
             buf_end: 0,
@@ -200,47 +204,46 @@ impl SerialReader {
     fn read(&mut self) -> Result<Message, ReadError> {
         let mut message = Message::new();
         let mut checksum: u8 = 0;
-        // let mut checksum_error_count = 0;
-        let mut state = ReaderState::Idle;
-        let mut state_after_hex = ReaderState::Idle;
+        let mut state = DecoderState::Idle;
+        let mut state_after_hex = DecoderState::Idle;
         self.field_name.clear();
         self.field_value.clear();
 
         loop {
             let b = self.next_byte()?;
 
-            if b == b':' && state != ReaderState::Checksum {
+            if b == b':' && state != DecoderState::Checksum {
                 state_after_hex = state;
-                state = ReaderState::HexRecord;
+                state = DecoderState::HexRecord;
                 // log::warn!("Detected hex record");
             }
 
-            if state != ReaderState::HexRecord {
+            if state != DecoderState::HexRecord {
                 checksum = checksum.wrapping_add(b);
             }
 
             match &state {
-                ReaderState::Idle => {
+                DecoderState::Idle => {
                     // wait for \n marking start of record
                     if b == b'\n' {
-                        state = ReaderState::FieldName;
+                        state = DecoderState::FieldName;
                     }
                 }
-                ReaderState::FieldName => {
+                DecoderState::FieldName => {
                     // 	read field name terminated by \t
                     match b {
                         b'\t' => {
                             if self.field_name == "Checksum" {
-                                state = ReaderState::Checksum;
+                                state = DecoderState::Checksum;
                             } else {
-                                state = ReaderState::FieldValue;
+                                state = DecoderState::FieldValue;
                             }
                         }
                         c if c.is_ascii() => self.field_name.push(c as char),
                         c => log::warn!("Unexpected non-ascii character '{}'", c),
                     };
                 }
-                ReaderState::FieldValue => {
+                DecoderState::FieldValue => {
                     // read field value terminated by \n
                     match b {
                         b'\r' => { /* ignore */ }
@@ -251,13 +254,13 @@ impl SerialReader {
                                 .ok();
                             self.field_name.clear();
                             self.field_value.clear();
-                            state = ReaderState::FieldName;
+                            state = DecoderState::FieldName;
                         }
                         c if c.is_ascii() => self.field_value.push(c as char),
                         c => log::warn!("Unexpected non-ascii character '{}'", c),
                     };
                 }
-                ReaderState::Checksum => {
+                DecoderState::Checksum => {
                     // checksum byte has jsut been received and added to checksum value, which should now be 0
                     if checksum == 0 {
                         return Ok(message);
@@ -265,7 +268,7 @@ impl SerialReader {
                         return Err(ReadError::ChecksumError);
                     }
                 }
-                ReaderState::HexRecord => {
+                DecoderState::HexRecord => {
                     // ignore everything until \n char
                     if b == b'\n' {
                         state = state_after_hex.clone();
@@ -285,7 +288,7 @@ impl SerialReader {
             } else {
                 // load more bytes into buffer
                 self.buf_start = 0;
-                self.buf_end = match self.port.read(&mut self.buf[..]) {
+                self.buf_end = match self.reader.read(&mut self.buf[..]) {
                     Ok(read_count) => read_count,
                     Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                         return Err(ReadError::Timeout);
@@ -302,4 +305,33 @@ enum ReadError {
     Timeout,
     ChecksumError,
     Other(String),
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+
+    #[test]
+    fn test_simple_read() {
+        let mut stream = Vec::new();
+        append_packet(&mut stream, b"\nPID\t42\nChecksum\t");
+
+        let mut decoder = SerialDecoder::new(stream.as_slice());
+        let actual = decoder.read().unwrap();
+        let expected = Message {
+            product_id: Some("42".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(actual, expected);
+    }
+
+    fn append_packet(stream: &mut Vec<u8>, data: &[u8]) {
+        stream.extend(data);
+        stream.push(compute_checksum(data));
+    }
+
+    fn compute_checksum(data: &[u8]) -> u8 {
+        0u8.wrapping_sub(data.into_iter().fold(0u8, |acc, val| acc.wrapping_add(*val)))
+    }
 }
