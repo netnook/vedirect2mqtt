@@ -55,8 +55,8 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, config: Config) -> R
     log::info!("MQTT connecting.");
 
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-    client.subscribe(&clear_topic, QoS::AtMostOnce).await.unwrap();
 
+    let loop_client = client.clone();
     task::spawn(async move {
         loop {
             time::sleep(Duration::from_millis(500)).await;
@@ -70,10 +70,10 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, config: Config) -> R
                     continue;
                 }
 
-                client
+                loop_client
                     .publish(config.mqtt.topic.clone(), QoS::AtLeastOnce, false, json.unwrap())
                     .await
-                    .map_err(|e| log::warn!("Error publishine message: {}", e))
+                    .map_err(|e| log::warn!("Error publishing message: {}", e))
                     .ok();
             }
         }
@@ -90,14 +90,17 @@ async fn start_mqtt(data: DataLock, reset: Arc<AtomicBool>, config: Config) -> R
                 }
             }
             Ok(Event::Incoming(Incoming::ConnAck(_))) => {
-                log::info!("MQTT connected.");
+                log::info!("MQTT connected.  Subscribing");
+                client.subscribe(&clear_topic, QoS::AtMostOnce).await.unwrap();
             }
             Ok(Event::Incoming(Incoming::PingReq)) => (),
             Ok(Event::Incoming(Incoming::PingResp)) => (),
             Ok(Event::Outgoing(Outgoing::PingResp)) => (),
             Ok(Event::Outgoing(Outgoing::PingReq)) => (),
             Ok(Event::Outgoing(Outgoing::Subscribe(_))) => (),
-            Ok(Event::Incoming(Incoming::SubAck(_))) => (),
+            Ok(Event::Incoming(Incoming::SubAck(s))) => {
+                log::info!("Subscription acknowledge: {:?}", s.return_codes);
+            }
             Ok(Event::Outgoing(Outgoing::Publish(_))) => (),
             Ok(Event::Incoming(Incoming::PubAck(_))) => (),
             Err(ConnectionError::Io(_)) => {
@@ -148,6 +151,8 @@ fn start_receiver(port: Box<dyn SerialPort>, data: DataLock, reset: Arc<AtomicBo
             }
 
             if now >= publish_message_at && collector.message_count() > 0 {
+                log::debug!("Receiver publishing message");
+
                 if reset.swap(false, Ordering::Relaxed) {
                     // FIXME: this reset means count=0 and no value gets transmitted.  How to guarantee the 0 gets sent ?
                     collector.reset_totals();

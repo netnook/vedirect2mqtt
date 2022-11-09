@@ -1,8 +1,8 @@
-use std::cmp::Ordering;
-use std::time::Instant;
-
 use serde_json::Map;
 use serde_json::Value;
+use std::time::Instant;
+
+const MA_SEC_TO_MA_HOUR: f64 = 1.0 / 3600.0;
 
 trait InsertJson {
     fn insert_json(&self, map: &mut Map<String, Value>, key: &str);
@@ -41,42 +41,23 @@ impl InsertJson for usize {
 }
 
 #[derive(Debug, Default)]
-struct NumberCollector<T> {
+struct AveragingCollector<T> {
     sum: T,
     count: usize,
 }
 
-impl<T> NumberCollector<T>
+impl<T> AveragingCollector<T>
 where
-    T: std::ops::AddAssign + Default,
+    T: std::ops::AddAssign + AsF64 + Default,
 {
-    fn add(&mut self, value: Option<T>) {
+    fn collect(&mut self, value: Option<T>) {
         if let Some(v) = value {
             self.sum += v;
             self.count += 1;
         }
     }
 
-    fn increment_count(&mut self) {
-        self.count += 1
-    }
-
-    fn clear_count(mut self) -> Self {
-        self.count = 0;
-        self
-    }
-
-    fn reset(&mut self) {
-        self.sum = Default::default();
-        self.count = 0;
-    }
-}
-
-impl<T> NumberCollector<T>
-where
-    T: AsF64,
-{
-    fn insert_avg_json(&self, map: &mut Map<String, Value>, key: &str) {
+    fn insert_json(&self, map: &mut Map<String, Value>, key: &str) {
         if self.count > 0 {
             let mut val: f64 = self.sum.as_f64() / self.count as f64;
             val = (val * 100.0).round() / 100.0;
@@ -84,14 +65,51 @@ where
             map.insert(key.to_string(), Value::Number(json_val.expect("Unable to make json val from f64")));
         }
     }
+}
 
-    fn insert_factored_json(&self, map: &mut Map<String, Value>, key: &str, factor: f64) {
-        if self.count > 0 {
-            let mut val: f64 = self.sum.as_f64() * factor;
+#[derive(Debug, Default)]
+struct IntegratingCollector<T> {
+    sum: T,
+    set: bool,
+    clamp_min: Option<T>,
+    clamp_max: Option<T>,
+    factor: T,
+}
+
+impl<T> IntegratingCollector<T>
+where
+    T: std::ops::AddAssign + AsF64 + Default + std::cmp::PartialOrd + Copy,
+{
+    fn collect(&mut self, value: Option<T>) {
+        if let Some(v) = value {
+            self.sum += v;
+            self.set = true;
+
+            if let Some(clamp_min) = self.clamp_min {
+                if self.sum < clamp_min {
+                    self.sum = clamp_min;
+                }
+            }
+            if let Some(clamp_max) = self.clamp_max {
+                if self.sum > clamp_max {
+                    self.sum = clamp_max;
+                }
+            }
+        }
+    }
+
+    fn insert_json(&self, map: &mut Map<String, Value>, key: &str) {
+        if self.set {
+            let mut val: f64 = self.sum.as_f64() * self.factor.as_f64();
             val = (val * 1000.0).round() / 1000.0;
             let json_val = serde_json::value::Number::from_f64(val);
             map.insert(key.to_string(), Value::Number(json_val.expect("Unable to make json val from f64")));
         }
+    }
+
+    fn reset(&mut self) {
+        self.sum = Default::default();
+        self.set = false;
     }
 }
 
@@ -113,21 +131,21 @@ impl AsF64 for f64 {
 
 #[derive(Debug, Default)]
 pub struct Collector {
-    main_battery_voltage: NumberCollector<isize>,
-    channel2_battery_voltage: NumberCollector<isize>,
-    channel3_battery_voltage: NumberCollector<isize>,
-    auxiliary_starter_voltage: NumberCollector<isize>,
-    battery_bank_midpoint_voltage: NumberCollector<isize>,
-    battery_bank_midpoint_deviation: NumberCollector<isize>,
-    panel_voltage: NumberCollector<isize>,
-    panel_power: NumberCollector<isize>,
-    main_battery_current: NumberCollector<isize>,
-    channel2_battery_current: NumberCollector<isize>,
-    channel3_battery_current: NumberCollector<isize>,
-    load_current: NumberCollector<isize>,
+    main_battery_voltage: AveragingCollector<isize>,
+    channel2_battery_voltage: AveragingCollector<isize>,
+    channel3_battery_voltage: AveragingCollector<isize>,
+    auxiliary_starter_voltage: AveragingCollector<isize>,
+    battery_bank_midpoint_voltage: AveragingCollector<isize>,
+    battery_bank_midpoint_deviation: AveragingCollector<isize>,
+    panel_voltage: AveragingCollector<isize>,
+    panel_power: AveragingCollector<isize>,
+    main_battery_current: AveragingCollector<isize>,
+    channel2_battery_current: AveragingCollector<isize>,
+    channel3_battery_current: AveragingCollector<isize>,
+    load_current: AveragingCollector<isize>,
     load_output_state: Option<String>,
-    battery_temperature: NumberCollector<isize>,
-    instantaneous_power: NumberCollector<isize>,
+    battery_temperature: AveragingCollector<isize>,
+    instantaneous_power: AveragingCollector<isize>,
     consumed_amp_hours: Option<isize>,
     state_of_charge: Option<isize>,
     time_to_go: Option<isize>,
@@ -166,17 +184,15 @@ pub struct Collector {
     serial_number: Option<String>,
     day_sequence_number: Option<isize>,
     device_mode: Option<isize>,
-    ac_output_voltage: NumberCollector<isize>,
-    ac_output_current: NumberCollector<isize>,
-    ac_output_apparent_power: NumberCollector<isize>,
+    ac_output_voltage: AveragingCollector<isize>,
+    ac_output_current: AveragingCollector<isize>,
+    ac_output_apparent_power: AveragingCollector<isize>,
     warning_reason: Option<isize>,
     tracker_mode_operation: Option<isize>,
     dc_monitor_mode: Option<isize>,
 
-    main_battery_energy_in_total: NumberCollector<f64>,
-    main_battery_energy_out_total: NumberCollector<f64>,
-
     last_collected_instant: Option<Instant>,
+    main_battery_amp_hour_total: IntegratingCollector<f64>,
 
     message_count: usize,
     checksum_error_count: usize,
@@ -184,13 +200,21 @@ pub struct Collector {
 
 impl Collector {
     pub fn new() -> Collector {
-        Collector::default()
+        Collector {
+            main_battery_amp_hour_total: IntegratingCollector {
+                sum: 0.0,
+                set: false,
+                factor: MA_SEC_TO_MA_HOUR,
+                clamp_max: Some(0.0),
+                clamp_min: None,
+            },
+            ..Default::default()
+        }
     }
 
     pub(crate) fn next(old: Collector) -> Collector {
         Collector {
-            main_battery_energy_in_total: old.main_battery_energy_in_total.clear_count(),
-            main_battery_energy_out_total: old.main_battery_energy_out_total.clear_count(),
+            main_battery_amp_hour_total: old.main_battery_amp_hour_total,
             last_collected_instant: old.last_collected_instant,
             ..Default::default()
         }
@@ -205,26 +229,27 @@ impl Collector {
     }
 
     pub fn reset_totals(&mut self) {
-        self.main_battery_energy_in_total.reset();
-        self.main_battery_energy_out_total.reset();
+        self.main_battery_amp_hour_total.reset();
     }
 
     pub(crate) fn collect(&mut self, msg: Message) {
-        self.main_battery_voltage.add(msg.main_battery_voltage);
-        self.channel2_battery_voltage.add(msg.channel2_battery_voltage);
-        self.channel3_battery_voltage.add(msg.channel3_battery_voltage);
-        self.auxiliary_starter_voltage.add(msg.auxiliary_starter_voltage);
-        self.battery_bank_midpoint_voltage.add(msg.battery_bank_midpoint_voltage);
-        self.battery_bank_midpoint_deviation.add(msg.battery_bank_midpoint_deviation);
-        self.panel_voltage.add(msg.panel_voltage);
-        self.panel_power.add(msg.panel_power);
-        self.main_battery_current.add(msg.main_battery_current);
-        self.channel2_battery_current.add(msg.channel2_battery_current);
-        self.channel3_battery_current.add(msg.channel3_battery_current);
-        self.load_current.add(msg.load_current);
+        let old_state_of_op = self.state_of_operation;
+
+        self.main_battery_voltage.collect(msg.main_battery_voltage);
+        self.channel2_battery_voltage.collect(msg.channel2_battery_voltage);
+        self.channel3_battery_voltage.collect(msg.channel3_battery_voltage);
+        self.auxiliary_starter_voltage.collect(msg.auxiliary_starter_voltage);
+        self.battery_bank_midpoint_voltage.collect(msg.battery_bank_midpoint_voltage);
+        self.battery_bank_midpoint_deviation.collect(msg.battery_bank_midpoint_deviation);
+        self.panel_voltage.collect(msg.panel_voltage);
+        self.panel_power.collect(msg.panel_power);
+        self.main_battery_current.collect(msg.main_battery_current);
+        self.channel2_battery_current.collect(msg.channel2_battery_current);
+        self.channel3_battery_current.collect(msg.channel3_battery_current);
+        self.load_current.collect(msg.load_current);
         self.load_output_state = msg.load_output_state;
-        self.battery_temperature.add(msg.battery_temperature);
-        self.instantaneous_power.add(msg.instantaneous_power);
+        self.battery_temperature.collect(msg.battery_temperature);
+        self.instantaneous_power.collect(msg.instantaneous_power);
         self.consumed_amp_hours = msg.consumed_amp_hours;
         self.state_of_charge = msg.state_of_charge;
         self.time_to_go = msg.time_to_go;
@@ -263,9 +288,9 @@ impl Collector {
         self.serial_number = msg.serial_number;
         self.day_sequence_number = msg.day_sequence_number;
         self.device_mode = msg.device_mode;
-        self.ac_output_voltage.add(msg.ac_output_voltage);
-        self.ac_output_current.add(msg.ac_output_current);
-        self.ac_output_apparent_power.add(msg.ac_output_apparent_power);
+        self.ac_output_voltage.collect(msg.ac_output_voltage);
+        self.ac_output_current.collect(msg.ac_output_current);
+        self.ac_output_apparent_power.collect(msg.ac_output_apparent_power);
         self.warning_reason = msg.warning_reason;
         self.tracker_mode_operation = msg.tracker_mode_operation;
         self.dc_monitor_mode = msg.dc_monitor_mode;
@@ -274,22 +299,27 @@ impl Collector {
         if let Some(last_collected_instant) = self.last_collected_instant {
             let secs_since_last_collection = (now - last_collected_instant).as_secs_f64();
             if let Some(c) = msg.main_battery_current {
-                match c.cmp(&0) {
-                    Ordering::Greater => {
-                        self.main_battery_energy_in_total.add(Some(c as f64 * secs_since_last_collection));
-                        self.main_battery_energy_out_total.increment_count();
-                    }
-                    Ordering::Less => {
-                        self.main_battery_energy_in_total.increment_count();
-                        self.main_battery_energy_out_total.add(Some(-c as f64 * secs_since_last_collection));
-                    }
-                    Ordering::Equal => (),
-                }
+                let delta = c as f64 * secs_since_last_collection;
+                self.main_battery_amp_hour_total.collect(Some(delta));
+                // log::info!(
+                //     "Collector: delta_time={}, current={}, delta={}, sum={}",
+                //     secs_since_last_collection,
+                //     c,
+                //     delta,
+                //     self.main_battery_amp_hour_total.sum
+                // );
             }
         }
         self.last_collected_instant = Some(now);
 
         self.message_count += 1;
+
+        let new_state_of_op = self.state_of_operation;
+
+        if old_state_of_op.unwrap_or(-1) != StateOfOperation::Float as isize && new_state_of_op.unwrap_or(-1) == StateOfOperation::Float as isize {
+            // Change int StateOfOperation::Float
+            self.main_battery_amp_hour_total.sum = 0.0;
+        }
     }
 
     pub fn build_json_message(&self) -> Value {
@@ -297,21 +327,21 @@ impl Collector {
 
         let mm = &mut map;
 
-        self.main_battery_voltage.insert_avg_json(mm, "main_battery_voltage");
-        self.channel2_battery_voltage.insert_avg_json(mm, "channel2_battery_voltage");
-        self.channel3_battery_voltage.insert_avg_json(mm, "channel3_battery_voltage");
-        self.auxiliary_starter_voltage.insert_avg_json(mm, "auxiliary_starter_voltage");
-        self.battery_bank_midpoint_voltage.insert_avg_json(mm, "battery_bank_midpoint_voltage");
-        self.battery_bank_midpoint_deviation.insert_avg_json(mm, "battery_bank_midpoint_deviation");
-        self.panel_voltage.insert_avg_json(mm, "panel_voltage");
-        self.panel_power.insert_avg_json(mm, "panel_power");
-        self.main_battery_current.insert_avg_json(mm, "main_battery_current");
-        self.channel2_battery_current.insert_avg_json(mm, "channel2_battery_current");
-        self.channel3_battery_current.insert_avg_json(mm, "channel3_battery_current");
-        self.load_current.insert_avg_json(mm, "load_current");
+        self.main_battery_voltage.insert_json(mm, "main_battery_voltage");
+        self.channel2_battery_voltage.insert_json(mm, "channel2_battery_voltage");
+        self.channel3_battery_voltage.insert_json(mm, "channel3_battery_voltage");
+        self.auxiliary_starter_voltage.insert_json(mm, "auxiliary_starter_voltage");
+        self.battery_bank_midpoint_voltage.insert_json(mm, "battery_bank_midpoint_voltage");
+        self.battery_bank_midpoint_deviation.insert_json(mm, "battery_bank_midpoint_deviation");
+        self.panel_voltage.insert_json(mm, "panel_voltage");
+        self.panel_power.insert_json(mm, "panel_power");
+        self.main_battery_current.insert_json(mm, "main_battery_current");
+        self.channel2_battery_current.insert_json(mm, "channel2_battery_current");
+        self.channel3_battery_current.insert_json(mm, "channel3_battery_current");
+        self.load_current.insert_json(mm, "load_current");
         self.load_output_state.insert_json(mm, "load_output_state");
-        self.battery_temperature.insert_avg_json(mm, "battery_temperature");
-        self.instantaneous_power.insert_avg_json(mm, "instantaneous_power");
+        self.battery_temperature.insert_json(mm, "battery_temperature");
+        self.instantaneous_power.insert_json(mm, "instantaneous_power");
         self.consumed_amp_hours.insert_json(mm, "consumed_amp_hours");
         self.state_of_charge.insert_json(mm, "state_of_charge");
         self.time_to_go.insert_json(mm, "time_to_go");
@@ -353,18 +383,14 @@ impl Collector {
         self.serial_number.insert_json(mm, "serial_number");
         self.day_sequence_number.insert_json(mm, "day_sequence_number");
         self.device_mode.insert_json(mm, "device_mode");
-        self.ac_output_voltage.insert_avg_json(mm, "ac_output_voltage");
-        self.ac_output_current.insert_avg_json(mm, "ac_output_current");
-        self.ac_output_apparent_power.insert_avg_json(mm, "ac_output_apparent_power");
+        self.ac_output_voltage.insert_json(mm, "ac_output_voltage");
+        self.ac_output_current.insert_json(mm, "ac_output_current");
+        self.ac_output_apparent_power.insert_json(mm, "ac_output_apparent_power");
         self.warning_reason.insert_json(mm, "warning_reason");
         self.tracker_mode_operation.insert_json(mm, "tracker_mode_operation");
         self.dc_monitor_mode.insert_json(mm, "dc_monitor_mode");
 
-        const MA_SEC_TO_MA_HOUR: f64 = 1.0 / 3600.0;
-        self.main_battery_energy_in_total
-            .insert_factored_json(mm, "main_battery_energy_in_total", MA_SEC_TO_MA_HOUR);
-        self.main_battery_energy_out_total
-            .insert_factored_json(mm, "main_battery_energy_out_total", MA_SEC_TO_MA_HOUR);
+        self.main_battery_amp_hour_total.insert_json(mm, "main_battery_amp_hour_total");
 
         self.message_count.insert_json(mm, "message_count");
         self.checksum_error_count.insert_json(mm, "checksum_error_count");
@@ -515,4 +541,23 @@ fn as_int(value: &str) -> Result<isize, String> {
 
 fn as_float(value: &str, factor: f32) -> Result<f32, String> {
     value.parse::<f32>().map(|v| v * factor).map_err(|e| format!("Invalid float {}", e))
+}
+
+#[allow(dead_code)]
+enum StateOfOperation {
+    Off = 0,
+    LowPower = 1,
+    Fault = 2,
+    Bulk = 3,
+    Absorption = 4,
+    Float = 5,
+    Storage = 6,
+    EqualizeManual = 7,
+    Inverting = 9,
+    PowerSupply = 11,
+    StartingUp = 245,
+    RepeatedAbsorption = 246,
+    AutoEqualize = 247,
+    BatterySafe = 248,
+    ExternalControl = 252,
 }
